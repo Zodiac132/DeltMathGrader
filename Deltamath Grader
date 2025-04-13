@@ -283,68 +283,86 @@ def on_drag_leave(event):
 # --- MODIFIED: Handle Drop ---
 def on_drop_excel_file(event):
     global excel_filepath, is_dragging_over
-    print(f"Drop detected. Event Data Raw: '{event.data}'") # Log raw data
+    print(f"Drop detected. Event Type: {type(event.data)}, Raw Data: '{event.data}'") # More detailed log
 
     # --- Revert Visual Feedback Immediately ---
-    was_dragging = is_dragging_over
+    was_dragging = is_dragging_over # Store if we were actually hovering
     is_dragging_over = False
     try:
         if left_panel: left_panel.configure(style="TFrame")
-        # Reset the label text AFTER processing the drop below
     except Exception as e: print(f"Error reverting style on drop: {e}")
 
     # --- Process Dropped Data ---
     excel_file_found = None
-    dropped_files = []
+    dropped_items = [] # Use a more generic name
+    data_str = event.data
+
     try:
-        data_str = event.data
-        # Basic check if data is likely file path(s) before complex parsing
-        if isinstance(data_str, str) and data_str.strip():
-            # Handle tuple data if necessary (seen in some dnd versions)
-            if isinstance(data_str, tuple): data_str = ' '.join(data_str)
+        # Attempt to convert to string if not already (handles bytes, etc. cautiously)
+        if not isinstance(data_str, str):
+            try: data_str = str(data_str, encoding='utf-8') # Try decoding if bytes
+            except TypeError: data_str = str(data_str) # Fallback to basic string conversion
+            print(f"Converted event.data to string: '{data_str}'")
 
-            # Try parsing using shlex, handle paths with spaces/braces
+        if data_str.strip():
+            # Remove potential surrounding braces first (common from Windows Explorer)
+            path_string = data_str.strip().strip('{}')
+            print(f"Processing path string: '{path_string}'")
+
+            # Use shlex for robust parsing (handles spaces, quotes)
             try:
-                # Remove potential surrounding braces first
-                path_string = data_str.strip('{}')
                 # Use posix=False on Windows for backslash compatibility
-                dropped_files = shlex.split(path_string, posix=(sys.platform != 'win32'))
-                print(f"Parsed dropped files via shlex: {dropped_files}")
+                # Handle potential empty string after stripping braces
+                if path_string:
+                    dropped_items = shlex.split(path_string, posix=(sys.platform != 'win32'))
+                else:
+                    dropped_items = []
+                print(f"Parsed dropped items via shlex: {dropped_items}")
             except ValueError as shex:
+                # Fallback: Basic split (less reliable for paths with spaces)
                 print(f"shlex parsing failed ({shex}), trying basic split.")
-                # Fallback: Simple split, might fail on paths with spaces
-                dropped_files = [p.strip() for p in path_string.split()]
-                print(f"Parsed dropped files via basic split: {dropped_files}")
+                if path_string: # Avoid splitting empty string
+                    dropped_items = [p.strip() for p in path_string.split()]
+                else:
+                    dropped_items = []
+                print(f"Parsed dropped items via basic split: {dropped_items}")
 
-            if not dropped_files:
-                print("Parsing resulted in no files.")
+            if not dropped_items:
+                print("Parsing resulted in no file paths.")
 
             # --- Validate Files ---
             # Find the first *valid* .xlsx file among potentially multiple dropped items
-            for fpath in dropped_files:
-                # Clean up path just in case (remove quotes if shlex didn't)
-                cleaned_path = fpath.strip('\'"')
+            for item_path in dropped_items:
+                # Clean up path just in case (remove extra quotes if shlex didn't)
+                cleaned_path = item_path.strip('\'"')
                 print(f"Checking dropped item: '{cleaned_path}'")
-                if os.path.isfile(cleaned_path) and cleaned_path.lower().endswith(".xlsx") and not os.path.basename(cleaned_path).startswith('~'):
-                    excel_file_found = cleaned_path
-                    print(f"Valid Excel file found: {excel_file_found}")
-                    break # Stop after finding the first valid one
-                else:
-                    print(f"Item '{cleaned_path}' is not a valid .xlsx file.")
+                try:
+                    # Use Path object for robust checking
+                    p = Path(cleaned_path)
+                    if p.is_file() and p.suffix.lower() == ".xlsx" and not p.name.startswith('~'):
+                        excel_file_found = str(p) # Convert back to string for consistency
+                        print(f"Valid Excel file found: {excel_file_found}")
+                        break # Stop after finding the first valid one
+                    else:
+                         print(f"Item '{cleaned_path}' validation failed (Exists: {p.exists()}, IsFile: {p.is_file()}, SuffixOK: {p.suffix.lower() == '.xlsx'}, NameOK: {not p.name.startswith('~')})")
+                except Exception as path_err:
+                     print(f"Error checking path '{cleaned_path}': {path_err}")
         else:
-             print(f"Dropped data is not a processable string: Type={type(data_str)}")
+             print("Dropped data resulted in empty string.")
 
     except Exception as parse_err:
         print(f"Error during drop processing: {parse_err}")
+        import traceback
+        traceback.print_exc() # Print full traceback for parsing errors
         messagebox.showerror("Drop Error", f"Could not process dropped item:\n{parse_err}", parent=root)
-        # Ensure label is reset after error
+        # Ensure label is reset even after error
         root.after(0, update_excel_status_label)
-        return
+        return # Stop processing on error
 
     # --- Update based on validation result ---
     if excel_file_found:
         excel_filepath = excel_file_found
-        print(f"Setting Excel filepath: {excel_filepath}")
+        print(f"Setting global Excel filepath: {excel_filepath}")
         # Update the status label and show confirmation
         root.after(0, update_excel_status_label) # Use helper via after()
         messagebox.showinfo("Excel File Selected",
@@ -352,16 +370,15 @@ def on_drop_excel_file(event):
                             parent=root)
     else:
         # No valid excel file found in the drop
-        print(f"No valid .xlsx file found in dropped items: {dropped_files}")
-        # Show warning *only if* something was actually dragged/dropped
-        if was_dragging or dropped_files: # Check if there was intent
+        print(f"No valid .xlsx file found in dropped items: {dropped_items}")
+        # Show warning *only if* something was actually dragged/dropped and parsing yielded items
+        if was_dragging or dropped_items: # Check if there was intent or items parsed
             messagebox.showwarning("Invalid File Drop",
                                    "Rejected.\nPlease drop only a single, valid Excel (.xlsx) file.",
                                    parent=root)
         # Reset label to show the previous or default state
         root.after(0, update_excel_status_label)
-
-
+        
 # --- In-GUI Text Editor Functions (remain the same) ---
 def load_text_for_editing(period_num):
     global editor_current_filename
