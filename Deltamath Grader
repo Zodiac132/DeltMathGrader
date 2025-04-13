@@ -408,7 +408,7 @@ def save_edited_text_auto():
 
 
 # --- UI Setup ---
-root = tk_class() # Use TkinterDnD's Tk or fallback tk.Tk
+
 root.title("DeltaMath Grader 2.3") # Version Bump
 root.minsize(750, 700)
 
