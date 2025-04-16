@@ -5,164 +5,403 @@ from tkinter import ttk
 from tkinter import messagebox
 import tkinter.simpledialog
 import os
-# import pandas as pd # Defer pandas import for faster startup
-from fuzzywuzzy import fuzz
-import keyboard # Needed for auto-grade trigger
-import pyautogui # Needed for auto-grade typing
-import subprocess
+import subprocess # Needed for auto-install and opening folders
+import sys # Needed for sys.executable and platform checks
 import re
 import threading
 import time
-import sys
 import shlex # Used for parsing drag/drop paths
 import webbrowser # Required to open web links
 from pathlib import Path
+import importlib # Needed to check module availability dynamically
 
-# --- CORRECTED Import drag and drop library ---
+# --- Function to Check and Install Dependencies ---
+def check_and_install_dependencies(root_window=None):
+    """Checks for required and optional dependencies and prompts for installation."""
+    required_packages = {
+        "pandas": "pandas",
+        "fuzzywuzzy": "fuzzywuzzy[speedup]", # Include speedup extras
+        "openpyxl": "openpyxl" # Essential for pandas .xlsx support
+    }
+    optional_packages = {
+        "keyboard": "keyboard", # For Auto Grade trigger
+        "pyautogui": "pyautogui", # For Auto Grade typing
+        "requests": "requests", # For Feedback feature
+        "tkinterdnd2": "tkinterdnd2" # For Drag and Drop
+    }
+    all_packages = {**required_packages, **optional_packages}
+    missing_packages = []
+    installation_failed = []
+
+    print("--- Checking Dependencies ---")
+    for import_name, install_name in all_packages.items():
+        try:
+            importlib.import_module(import_name)
+            print(f"[ OK ] {import_name} found.")
+        except ImportError:
+            print(f"[MISSING] {import_name} not found.")
+            missing_packages.append((import_name, install_name))
+
+    if not missing_packages:
+        print("--- All dependencies are satisfied ---")
+        return True # All good
+
+    # Create a temporary minimal Tk window if none is provided (for early checks)
+    temp_root = None
+    if root_window is None and missing_packages:
+        try:
+            temp_root = tk.Tk()
+            temp_root.withdraw() # Hide the temporary window
+            root_window = temp_root
+        except tk.TclError:
+             print("ERROR: Could not initialize Tkinter for prompts. Cannot install missing packages automatically.")
+             return False # Cannot proceed without Tkinter for prompts
+
+    # Prompt user for installation
+    install_prompt_message = "The following packages are missing or failed to import:\n\n"
+    install_prompt_message += "\n".join([f"- {imp} ({'required' if imp in required_packages else 'optional'})" for imp, _ in missing_packages])
+    install_prompt_message += "\n\nDo you want to attempt automatic installation using pip?"
+
+    # Make sure we have a valid window to parent the messagebox
+    parent_window = root_window if root_window and root_window.winfo_exists() else None
+
+    if not parent_window and not sys.stdout.isatty(): # No GUI window and not interactive terminal
+         print("ERROR: Cannot prompt for installation in non-interactive mode.")
+         return False # Cannot proceed
+
+    should_install = False
+    if parent_window:
+         should_install = messagebox.askyesno(
+             "Install Missing Packages?",
+             install_prompt_message,
+             parent=parent_window # Use the provided or temporary root
+         )
+    elif sys.stdout.isatty(): # Ask in console if no GUI but interactive
+         try:
+            response = input(install_prompt_message + " (y/n): ").lower()
+            should_install = response == 'y'
+         except EOFError: # Handle non-interactive environments piping input
+            print("Warning: Could not read response from input.")
+            should_install = False
+
+    if should_install:
+        print("--- Attempting installation ---")
+        # Use a set to keep track of unique failures
+        installation_failed_set = set()
+        for import_name, install_name in missing_packages:
+            # Skip if already failed
+            if import_name in installation_failed_set: continue
+
+            print(f"Installing {install_name}...")
+            try:
+                # Use sys.executable to ensure pip is called for the correct Python env
+                # Use -q for quieter output, capture stderr for better error messages
+                process = subprocess.run(
+                    [sys.executable, '-m', 'pip', 'install', '-q', install_name],
+                    check=True, capture_output=True, text=True, encoding='utf-8'
+                )
+                print(f"Successfully installed {install_name}.")
+            except subprocess.CalledProcessError as e:
+                error_details = e.stderr or e.stdout or "No error output captured."
+                error_msg = f"Failed to install {install_name}.\nCommand: '{' '.join(e.cmd)}'\nError: {error_details}\n\nPlease try installing manually."
+                print(f"ERROR: {error_msg}")
+                if parent_window: messagebox.showerror("Installation Failed", error_msg, parent=parent_window)
+                installation_failed_set.add(import_name)
+            except FileNotFoundError:
+                error_msg = f"Failed to install {install_name}.\n'pip' command not found ({sys.executable} -m pip).\nEnsure Python and pip are correctly installed and in your system's PATH."
+                print(f"ERROR: {error_msg}")
+                if parent_window: messagebox.showerror("Installation Failed", error_msg, parent=parent_window)
+                installation_failed_set.add(import_name)
+                break # Stop trying if pip isn't found
+            except Exception as e:
+                 error_msg = f"An unexpected error occurred while installing {install_name}: {e}"
+                 print(f"ERROR: {error_msg}")
+                 if parent_window: messagebox.showerror("Installation Failed", error_msg, parent=parent_window)
+                 installation_failed_set.add(import_name)
+
+        installation_failed = list(installation_failed_set) # Convert back to list
+
+        # Check if any *required* packages failed installation
+        failed_required = [imp for imp in installation_failed if imp in required_packages]
+        if failed_required:
+            msg = f"Failed to install required packages: {', '.join(failed_required)}.\nThe application cannot continue.\nPlease install them manually and restart."
+            print(f"FATAL ERROR: {msg}")
+            if parent_window: messagebox.showerror("Critical Error", msg, parent=parent_window)
+            if temp_root: temp_root.destroy()
+            sys.exit(f"Exiting due to missing required packages: {', '.join(failed_required)}") # Exit script
+
+        if installation_failed: # Only optional failed if we reach here
+             msg = f"Failed to install some optional packages: {', '.join(installation_failed)}.\nRelated features might be disabled.\nYou can try installing them manually."
+             print(f"WARNING: {msg}")
+             if parent_window: messagebox.showwarning("Optional Installation Failed", msg, parent=parent_window)
+
+        print("--- Dependency check finished ---")
+        # Return True only if *all* missing packages were installed successfully
+        all_installed_successfully = len(installation_failed) == 0
+
+    else: # User chose not to install
+        print("--- Installation skipped by user ---")
+        failed_required = [imp for imp, _ in missing_packages if imp in required_packages]
+        if failed_required:
+             msg = f"Required packages are missing: {', '.join(failed_required)} and installation was skipped.\nThe application cannot continue."
+             print(f"FATAL ERROR: {msg}")
+             if parent_window: messagebox.showerror("Critical Error", msg, parent=parent_window)
+             if temp_root: temp_root.destroy()
+             sys.exit(f"Exiting due to missing required packages: {', '.join(failed_required)}") # Exit script
+        else:
+            # Only optional packages missing and user skipped
+            missing_optional = [imp for imp, _ in missing_packages if imp in optional_packages]
+            if missing_optional:
+                msg = f"Optional packages are missing: {', '.join(missing_optional)} and installation was skipped.\nRelated features will be disabled."
+                print(f"WARNING: {msg}")
+                if parent_window: messagebox.showwarning("Features Disabled", msg, parent=parent_window)
+            all_installed_successfully = False # Indicate optional features might be missing
+
+    if temp_root:
+        temp_root.destroy()
+
+    # Rerun import check after attempting install to verify
+    final_missing = []
+    print("--- Verifying dependencies post-installation attempt ---")
+    for import_name, install_name in all_packages.items():
+         try:
+             importlib.import_module(import_name)
+             print(f"[ OK ] {import_name} verified.")
+         except ImportError:
+             print(f"[FAILED] {import_name} still missing after installation attempt.")
+             final_missing.append(import_name)
+
+    # Final critical check for required packages
+    missing_required_final = [m for m in final_missing if m in required_packages]
+    if missing_required_final:
+         msg = f"Required packages still missing after installation attempt: {', '.join(missing_required_final)}.\nApplication cannot run."
+         print(f"FATAL ERROR: {msg}")
+         if parent_window: messagebox.showerror("Critical Error", msg, parent=parent_window)
+         sys.exit(f"Exiting due to missing required packages: {', '.join(missing_required_final)}")
+
+    # Return True if all required are present, even if some optional failed
+    print("--- Dependency verification complete ---")
+    return True
+
+# --- Attempt dependency check and installation BEFORE full GUI setup ---
+check_and_install_dependencies()
+
+# --- Now Import Libraries (with flags for optional ones) ---
+try: import pandas as pd
+except ImportError: print("FATAL ERROR: pandas failed to import even after installation check."); sys.exit(1)
+try: from fuzzywuzzy import fuzz
+except ImportError: print("FATAL ERROR: fuzzywuzzy failed to import even after installation check."); sys.exit(1)
+try: import openpyxl # Although used by pandas, import to confirm
+except ImportError: print("FATAL ERROR: openpyxl failed to import even after installation check."); sys.exit(1)
+
+keyboard_available = False
+pyautogui_available = False
+requests_available = False
+tkinterdnd2_available = False
+tk_class = tk.Tk # Default to standard Tk
+DND_FILES = None # Default DND constant
+
 try:
-    # Corrected import based on diagnosis:
-    # Import the TkinterDnD class *from* the TkinterDnD module within the package
-    from tkinterdnd2.TkinterDnD import TkinterDnD
-    # Import constants like DND_FILES from the top level of the package
-    from tkinterdnd2 import DND_FILES
-    tk_class = TkinterDnD # Assign the imported class
-    print("tkinterdnd2 found, drag-and-drop enabled.")
+    import keyboard
+    keyboard_available = True
+    print("Optional: keyboard loaded.")
 except ImportError:
-    print("tkinterdnd2 library not found. Drag-and-drop disabled.")
-    print("Install using: pip install tkinterdnd2")
-    # Import standard tkinter only if DND fails
-    import tkinter as tk
-    tk_class = tk.Tk # Assign the standard Tk class
-    DND_FILES = None # DND_FILES constant is not available
-# --- End Corrected Import ---
+    print("Optional: keyboard not found.")
+except Exception as e:
+     print(f"Optional: Error loading keyboard - {e}")
+
+try:
+    import pyautogui
+    pyautogui_available = True
+    print("Optional: pyautogui loaded.")
+except ImportError:
+    print("Optional: pyautogui not found.")
+except Exception as e:
+     print(f"Optional: Error loading pyautogui - {e}")
+
+try:
+    import requests
+    requests_available = True
+    print("Optional: requests loaded.")
+except ImportError:
+    print("Optional: requests not found.")
+
+try:
+    from tkinterdnd2.TkinterDnD import TkinterDnD
+    from tkinterdnd2 import DND_FILES
+    tk_class = TkinterDnD
+    tkinterdnd2_available = True
+    print("Optional: tkinterdnd2 found, drag-and-drop enabled.")
+except ImportError:
+    print("Optional: tkinterdnd2 library not found. Drag-and-drop disabled.")
+except Exception as e:
+     print(f"Optional: Error loading tkinterdnd2 - {e}")
 
 # --- Configuration ---
 CLASS_GRADE_SHEET_URL = "https://gradebook.dadeschools.net/Pinnacle/Gradebook/"
 DATA_SUBFOLDER_NAME = "DeltaMathGraderData"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1362001033387053096/2wOn2D3p0GUruGEGlmriiijREU-wD869RL3U0k-tbni9mQ21z0NDPPI5y0ksGfnWJ9ty" if requests_available else None
 
 # --- Global Variables ---
 excel_filepath = None
 editor_current_filename = None
 editor_save_scheduled = None
-root = None
-is_dragging_over = False # Flag for hover state
+root = None # Will be assigned later
+is_dragging_over = False
 
-# --- Helper Functions (get_data_folder, get_period_filepath, etc.) ---
+# --- Helper Functions ---
 def get_data_folder():
+    """Gets the path to the application's data folder, creating it if necessary."""
     try:
         home_dir = Path.home()
         possible_docs_paths = [ home_dir / "Documents", home_dir / "My Documents" ]
         docs_dir = next((path for path in possible_docs_paths if path.is_dir()), home_dir)
-        if docs_dir == home_dir: print("Warning: Documents folder not found, using home.")
+        if docs_dir == home_dir: print("Warning: Documents folder not found, using home directory.")
         data_dir = docs_dir / DATA_SUBFOLDER_NAME
-        data_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True) # Create if it doesn't exist
         return str(data_dir)
     except Exception as e:
-        messagebox.showerror("Folder Error", f"Could not create/access data folder:\n{e}", parent=root)
+        msg = f"Could not create/access data folder:\n{e}"
+        print(f"ERROR: {msg}")
+        if root and root.winfo_exists(): messagebox.showerror("Folder Error", msg, parent=root)
         return os.getcwd()
 
 def get_period_filepath(period_num):
+    """Constructs the full path for a period's name list file."""
     return os.path.join(get_data_folder(), f"period{period_num}.txt")
 
 def load_names_from_file(filepath):
+    """Reads names from a text file, one per line."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f: names = [line.strip() for line in f if line.strip()]
+        with open(filepath, 'r', encoding='utf-8') as f:
+            names = [line.strip() for line in f if line.strip()]
         return names
-    except FileNotFoundError: return []
+    except FileNotFoundError:
+        return []
     except Exception as e:
-        if root: messagebox.showerror("Error", f"Error reading {os.path.basename(filepath)}:\n{e}", parent=root)
+        if root and root.winfo_exists():
+            messagebox.showerror("Error", f"Error reading {os.path.basename(filepath)}:\n{e}", parent=root)
         return []
 
 def read_text_file(filepath):
+    """Reads the entire content of a text file."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f: return f.read()
-    except FileNotFoundError: return ""
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
     except Exception as e:
-        if root: messagebox.showerror("Error", f"Error reading {os.path.basename(filepath)}:\n{e}", parent=root)
+        if root and root.winfo_exists():
+            messagebox.showerror("Error", f"Error reading {os.path.basename(filepath)}:\n{e}", parent=root)
         return ""
 
 def save_text_file(filepath, content, show_success=True):
+    """Saves text content to a file, creating directories if needed."""
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
-        if show_success and root:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        if show_success and root and root.winfo_exists():
              display_name = os.path.join("...", DATA_SUBFOLDER_NAME, os.path.basename(filepath))
-             # Use lambda to capture current display_name for the delayed message
              root.after(500, lambda name=display_name: messagebox.showinfo("Save Successful", f"Saved {name}", parent=root))
         return True
     except Exception as e:
         error_msg = f"Error saving {os.path.basename(filepath)}:\n{e}"
-        print(error_msg)
-        if root: messagebox.showerror("Save Error", error_msg, parent=root)
+        print(f"ERROR: {error_msg}")
+        if root and root.winfo_exists(): messagebox.showerror("Save Error", error_msg, parent=root)
         return False
 
 def find_downloads_folder():
-    home = Path.home(); path = home / "Downloads"
-    if path.is_dir(): return str(path)
-    print("Warning: Could not find Downloads folder."); return None
+    """Attempts to find the user's Downloads folder."""
+    try:
+        home = Path.home()
+        path = home / "Downloads"
+        if path.is_dir():
+            return str(path)
+    except Exception as e:
+         print(f"Error finding Downloads folder: {e}")
+    print("Warning: Could not find Downloads folder.")
+    return None
 
 def find_excel_file_automatically():
+    """Looks for .xlsx files in Downloads, prompting if multiple are found."""
     downloads_path = find_downloads_folder()
     if not downloads_path:
-        if root: messagebox.showerror("Error", "Could not find Downloads folder.", parent=root); return None
+        if root and root.winfo_exists(): messagebox.showerror("Error", "Could not find Downloads folder.", parent=root)
+        return None
+
     try:
-        excel_files = [ f for f in os.listdir(downloads_path) if os.path.isfile(os.path.join(downloads_path, f)) and f.lower().endswith(".xlsx") and not f.startswith("~") ]
+        excel_files = [
+            f for f in os.listdir(downloads_path)
+            if os.path.isfile(os.path.join(downloads_path, f))
+            and f.lower().endswith(".xlsx")
+            and not f.startswith("~")
+        ]
     except Exception as e:
-        if root: messagebox.showerror("Error", f"Error reading Downloads: {e}", parent=root); return None
-    if not excel_files: return None
-    elif len(excel_files) == 1: return os.path.join(downloads_path, excel_files[0])
+        if root and root.winfo_exists(): messagebox.showerror("Error", f"Error reading Downloads folder: {e}", parent=root)
+        return None
+
+    if not excel_files:
+        return None
+    elif len(excel_files) == 1:
+        return os.path.join(downloads_path, excel_files[0])
     else:
-        prompt_text = "Multiple Excel files found. Select one:\n\n" + "\n".join([f"{i+1}. {f}" for i, f in enumerate(excel_files)])
-        choice = tkinter.simpledialog.askstring("Select Excel File", prompt_text, parent=root)
+        prompt_text = "Multiple Excel files found in Downloads. Select one:\n\n"
+        prompt_text += "\n".join([f"{i+1}. {f}" for i, f in enumerate(excel_files)])
+        parent_win = root if root and root.winfo_exists() else None
+        choice = tkinter.simpledialog.askstring("Select Excel File", prompt_text, parent=parent_win)
         try:
             idx = int(choice) - 1
-            if 0 <= idx < len(excel_files): return os.path.join(downloads_path, excel_files[idx])
-        except (ValueError, TypeError, IndexError): pass # Handle invalid input or cancel
-        messagebox.showwarning("Invalid Choice", "No valid file selected.", parent=root); return None
+            if 0 <= idx < len(excel_files):
+                return os.path.join(downloads_path, excel_files[idx])
+        except (ValueError, TypeError, IndexError):
+            pass
+        if parent_win: messagebox.showwarning("Invalid Choice", "No valid file selected.", parent=parent_win)
+        return None
 
 # --- Name Matching / Processing ---
 def find_exact_match(name_to_find, df, first_name_column, last_name_column):
-    import pandas as pd
+    """Finds an exact match (case-insensitive) for a name in the DataFrame."""
     name_lower = name_to_find.lower().strip()
     for index, row in df.iterrows():
-        # Ensure conversion to string and handle potential NaN before stripping
         first = str(row.get(first_name_column, '')) if pd.notna(row.get(first_name_column)) else ''
         last = str(row.get(last_name_column, '')) if pd.notna(row.get(last_name_column)) else ''
         full_name = (first.strip() + ' ' + last.strip()).strip()
-        if name_lower == full_name.lower(): return row, index
+        if name_lower == full_name.lower():
+            return row, index
     return None, None
 
 def find_best_match(name_to_find, df, first_name_column, last_name_column, threshold=60):
-    import pandas as pd
+    """Finds the best fuzzy match for a name above a given threshold."""
     best_match_row, best_ratio, best_index = None, 0, None
     name_lower = name_to_find.lower().strip()
-    matched_df_name = None # Store the name from the dataframe that matched
+    matched_df_name = None
     for index, row in df.iterrows():
         first = str(row.get(first_name_column, '')) if pd.notna(row.get(first_name_column)) else ''
         last = str(row.get(last_name_column, '')) if pd.notna(row.get(last_name_column)) else ''
         full_name = (first.strip() + ' ' + last.strip()).strip()
         full_name_lower = full_name.lower()
-        if not full_name_lower: continue # Skip empty names in dataframe
+        if not full_name_lower: continue
         ratio = fuzz.token_sort_ratio(name_lower, full_name_lower)
         if ratio > best_ratio:
-            best_ratio, best_match_row, best_index = ratio, row, index
-            matched_df_name = full_name # Store the name as found in the df
-
+            best_ratio = ratio
+            best_match_row = row
+            best_index = index
+            matched_df_name = full_name
     if best_ratio >= threshold:
-        return best_match_row, best_ratio, best_index, matched_df_name # Return the df name
+        return best_match_row, best_ratio, best_index, matched_df_name
     return None, 0, None, None
 
 def process_name(name, df, first_col, last_col, grade_col, use_interval, interval_pct):
-    import pandas as pd
+    """Processes a single name: finds match, gets grade from specified column, applies interval logic."""
     exact_row, exact_idx = find_exact_match(name, df, first_col, last_col)
     grade_val, original_grade, match_type, details, target_idx = None, None, "Not Found", "", None
-    found_name = name # Default to original name if no match
+    found_name = name # Default to original name
 
     if exact_row is not None:
         target_idx = exact_idx
-        grade_val = exact_row.get(grade_col)
+        grade_val = exact_row.get(grade_col) # Get grade from the SELECTED column
         match_type = "Exact Match"
-        # Construct found name from exact match row
         first = str(exact_row.get(first_col, '')).strip() if pd.notna(exact_row.get(first_col)) else ''
         last = str(exact_row.get(last_col, '')).strip() if pd.notna(exact_row.get(last_col)) else ''
         found_name = f"{first} {last}".strip()
@@ -170,742 +409,821 @@ def process_name(name, df, first_col, last_col, grade_col, use_interval, interva
         match_row, ratio, match_idx, matched_df_name = find_best_match(name, df, first_col, last_col)
         if match_row is not None:
             target_idx = match_idx
-            grade_val = match_row.get(grade_col)
+            grade_val = match_row.get(grade_col) # Get grade from the SELECTED column
             match_type = "Fuzzy Match"
             details = f"(Ratio: {ratio}%)"
-            found_name = matched_df_name # Use the name from the matched row
+            found_name = matched_df_name
 
     if pd.notna(grade_val):
         try:
             original_grade = float(grade_val)
-            processed_grade = original_grade # Default to original
+            processed_grade = original_grade # Start with the original
+
             if use_interval:
                 processed_grade = 100.0 if original_grade >= interval_pct else 0.0
-                # Update the dataframe *passed into the function* if interval changed it
-                # Ensure target_idx is valid before attempting loc
+                # Update the *passed-in* DataFrame copy if interval changed the grade
                 if processed_grade != original_grade and target_idx is not None and target_idx in df.index:
-                    df.loc[target_idx, grade_col] = processed_grade # Update the DataFrame directly
+                    df.loc[target_idx, grade_col] = processed_grade # Update the specific grade column
 
             orig_str = f"{original_grade:.1f}%" if original_grade is not None else "N/A"
             proc_str = f"{processed_grade:.1f}%" if processed_grade is not None else "N/A"
-            # Format: OriginalName -> FoundName | ProcessedGrade (MatchType Details, Original: OrigGrade)
             return f"{name} -> {found_name} | {proc_str} ({match_type} {details}, Original: {orig_str})"
         except (ValueError, TypeError):
-            # Format: OriginalName -> FoundName | Invalid Grade (MatchType, Value: 'GradeValue')
-            return f"{name} -> {found_name} | Invalid Grade ({match_type}, Value: '{grade_val}')"
+             # Handle non-numeric grade values (e.g., "Complete")
+             processed_grade_non_numeric = 0.0 # Default assumption
+             original_value_str = str(grade_val).strip()
+
+             if use_interval:
+                 # Specific rule for "Complete" if interval grading is on
+                 if original_value_str.lower() == 'complete':
+                      processed_grade_non_numeric = 100.0
+                 # Otherwise, non-numeric values become 0.0 under interval grading
+
+                 # Update DataFrame if interval logic applies
+                 if target_idx is not None and target_idx in df.index:
+                     df.loc[target_idx, grade_col] = processed_grade_non_numeric
+                 return f"{name} -> {found_name} | {processed_grade_non_numeric:.1f}% ({match_type} {details}, Original: '{original_value_str}')"
+             else:
+                 # If not using interval, just report the non-numeric value found
+                 return f"{name} -> {found_name} | Non-Numeric ({match_type}, Value: '{original_value_str}')"
     else:
-        # Format: OriginalName -> FoundName | Grade Missing (MatchType Details)
+        # Grade value was NaN or missing in the Excel sheet for the matched row
         if match_type != "Not Found":
             return f"{name} -> {found_name} | Grade Missing ({match_type} {details})"
         else:
-            # Format: OriginalName | Grade Not Found (No Match)
+            # No match found at all
             return f"{name} | Grade Not Found (No Match)"
 
 # --- Grade Typing / Other Utilities ---
 def extract_grades_from_output(filepath):
+    """Extracts numerical grade values from the processed output file."""
     grades = []
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                if not line or '|' not in line: continue # Skip empty or invalid lines
+                if not line or '|' not in line: continue
                 try:
                     parts = line.split('|')
                     if len(parts) > 1:
-                        # Look for the percentage value in the second part
                         percentage_part = parts[1].strip()
-                        # Regex to find the first number (integer or float)
-                        match = re.match(r"^\s*([\d.]+)", percentage_part)
+                        match = re.match(r"^\s*([\d.]+)", percentage_part) # Find leading number
                         if match:
                             try:
                                 grade_float = float(match.group(1))
-                                # Format to one decimal place, then remove '.0' if it's an integer
                                 formatted_grade = f"{grade_float:.1f}".replace('.0', '')
                                 grades.append(formatted_grade)
                             except ValueError:
-                                print(f"Warn: Could not convert grade value '{match.group(1)}' to float in line: {line}")
-                        else:
-                            print(f"Warn: Could not find grade number in second part of line: {line}")
+                                print(f"Warn: Could not convert grade value '{match.group(1)}' in line: {line}")
+                        # else: Consider adding handling/warning if a grade is expected but not found numeric
                 except Exception as e:
                     print(f"Warn: Error parsing line content: {line} - {e}")
     except FileNotFoundError:
-        if root: messagebox.showerror("Error", f"Grade file not found:\n{filepath}", parent=root)
+        if root and root.winfo_exists(): messagebox.showerror("Error", f"Grade file not found:\n{filepath}", parent=root)
         return []
     except Exception as e:
-        if root: messagebox.showerror("Error", f"Error reading grades file:\n{e}", parent=root)
+        if root and root.winfo_exists(): messagebox.showerror("Error", f"Error reading grades file:\n{e}", parent=root)
         return []
     return grades
 
 def type_grades(grades_list):
-    if not root: return # Check if GUI exists
+    """Types the extracted grades using pyautogui, waiting for a trigger."""
+    if not root or not root.winfo_exists(): return
+    if not pyautogui_available:
+        print("ERROR: pyautogui not available for typing grades.")
+        if root and root.winfo_exists(): messagebox.showerror("Auto Grade Error", "PyAutoGUI library is missing or failed to load.\nCannot type grades.", parent=root)
+        return
     if not grades_list:
-        if root: messagebox.showwarning("Auto Grade", "No grades extracted to type.", parent=root)
+        if root and root.winfo_exists(): messagebox.showwarning("Auto Grade", "No grades extracted to type.", parent=root)
         return
 
-    print("Waiting for '*' key press to start typing...")
+    print("Waiting for trigger to start typing grades...")
+    trigger_received = False
     try:
-        # Minimize window before waiting, restore after
         root.after(0, root.iconify)
-        time.sleep(0.5) # Brief pause to ensure window is minimized
-        keyboard.wait('*') # Wait for the trigger key
+        time.sleep(0.5)
+        if keyboard_available:
+            print("Press '*' key to begin typing.")
+            keyboard.wait('*')
+            trigger_received = True
+            print("Detected '*'.")
+        else:
+            if root: messagebox.showinfo("Auto Grade", "Keyboard library missing or failed to load.\nClick OK when the gradebook field is focused to start typing immediately.", parent=root)
+            trigger_received = True
     except Exception as e:
-        if root: messagebox.showerror("Keyboard Error", f"Failed to wait for '*' key:\n{e}\n(Ensure script has permissions if needed)", parent=root)
-        try: root.after(0, root.deiconify) # Try to restore window on error
-        except tk.TclError: pass # Ignore if window already closed
-        return
+        if root and root.winfo_exists(): messagebox.showerror("Trigger Error", f"Failed waiting for trigger:\n{e}\n(Ensure script has permissions if needed, especially for 'keyboard')", parent=root)
+        trigger_received = False
     finally:
-        # Attempt to restore window regardless of wait success/failure, unless root is gone
         try:
             if root and root.winfo_exists():
                  root.after(0, root.deiconify)
-                 time.sleep(0.5) # Pause after restoring
-        except tk.TclError: pass # Ignore if window closed during wait
+                 root.after(100, root.focus_force)
+                 time.sleep(0.5)
+        except tk.TclError: pass
 
-    print(f"Detected '*'. Typing {len(grades_list)} grades...")
+    if not trigger_received:
+        print("Typing cancelled (no trigger received or error).")
+        return
+
+    print(f"Typing {len(grades_list)} grades...")
     try:
-        for grade in grades_list:
-            # Check if root still exists before typing each grade
+        for i, grade in enumerate(grades_list):
             if not root or not root.winfo_exists():
-                print("Window closed during typing. Aborting.")
+                print(f"Window closed during typing at grade {i+1}. Aborting.")
                 break
-            pyautogui.write(grade, interval=0.01) # Type grade value
+            pyautogui.write(grade, interval=0.01)
             time.sleep(0.05)
-            pyautogui.press('enter') # Press Enter to move to next field
-            time.sleep(0.15) # Pause between entries
-        print("Finished typing grades.")
-        if root and root.winfo_exists():
-             messagebox.showinfo("Auto Grade", "Finished typing grades.", parent=root)
+            pyautogui.press('enter')
+            time.sleep(0.15)
+        else:
+            print("Finished typing grades.")
+            if root and root.winfo_exists():
+                 messagebox.showinfo("Auto Grade", "Finished typing grades.", parent=root)
     except Exception as e:
-        print(f"Error during pyautogui typing: {e}")
+        error_msg = f"An error occurred during typing:\n{e}"
+        print(f"ERROR: {error_msg}")
         if root and root.winfo_exists():
-            messagebox.showerror("Typing Error", f"An error occurred during typing:\n{e}", parent=root)
+            messagebox.showerror("Typing Error", error_msg, parent=root)
 
 def auto_grade_action():
+    """Initiates the auto-grading process."""
     output_file_path = os.path.join(get_data_folder(), "output_grades.txt")
-    # Check if the output file exists in the data folder
     if not os.path.exists(output_file_path):
-         # Fallback: check if it exists in the script's CWD (less ideal)
          old_path = os.path.join(os.getcwd(), "output_grades.txt")
          if os.path.exists(old_path):
              output_file_path = old_path
              print(f"Using output file from script directory: {output_file_path}")
          else:
-             if root: messagebox.showwarning("Auto Grade", f"'output_grades.txt' not found in '{DATA_SUBFOLDER_NAME}' or script folder.\nRun 'Grade P X' first.", parent=root)
+             if root and root.winfo_exists(): messagebox.showwarning("Auto Grade", f"'output_grades.txt' not found in '{DATA_SUBFOLDER_NAME}' or script folder.\nRun 'Grade P X' first.", parent=root)
              return
 
     grades = extract_grades_from_output(output_file_path)
     if grades:
-        msg = f"Found {len(grades)} grades in '{os.path.basename(output_file_path)}'.\n\nClick OK, then focus the first grade field in your gradebook, and finally press the '*' key on your keyboard to begin typing."
-        if root: messagebox.showinfo("Auto Grade Ready", msg, parent=root)
-        # Run typing in a separate thread to avoid blocking the GUI
+        trigger_msg = "press the '*' key on your keyboard" if keyboard_available else "click OK on the next prompt"
+        msg = f"Found {len(grades)} grades in '{os.path.basename(output_file_path)}'.\n\n" \
+              f"Click OK, then focus the first grade field in your gradebook, and finally {trigger_msg} to begin typing."
+        if root and root.winfo_exists(): messagebox.showinfo("Auto Grade Ready", msg, parent=root)
         threading.Thread(target=type_grades, args=(grades,), daemon=True).start()
     else:
-        if root: messagebox.showwarning("Auto Grade", f"No valid grades found in '{os.path.basename(output_file_path)}'.", parent=root)
+        if root and root.winfo_exists(): messagebox.showwarning("Auto Grade", f"No valid grades found in '{os.path.basename(output_file_path)}'. Ensure 'Grade P X' was run successfully.", parent=root)
 
 def show_credits():
-    if root: messagebox.showinfo("Credits", "Made by: Adonis Yanez", parent=root)
+    """Displays the credits message box."""
+    if root and root.winfo_exists(): messagebox.showinfo("Credits", "DeltaMath Grader\nMade by: Adonis Yanez", parent=root)
 
 def open_gradebook_link():
+    """Opens the configured gradebook URL in a web browser."""
     url = CLASS_GRADE_SHEET_URL
     print(f"Opening gradebook link: {url}")
     try:
         webbrowser.open_new_tab(url)
     except Exception as e:
-        print(f"Error opening URL with webbrowser: {e}")
-        if root: messagebox.showerror("Error", f"Could not open the gradebook link:\n{e}", parent=root)
+        print(f"Error opening URL '{url}': {e}")
+        if root and root.winfo_exists(): messagebox.showerror("Error", f"Could not open the gradebook link:\n{e}", parent=root)
 
 def open_data_folder():
+    """Opens the application's data folder in the system's file explorer."""
     data_dir = get_data_folder()
     print(f"Opening data folder: {data_dir}")
     try:
-        # Use platform-specific commands for opening folders
         if sys.platform == "win32":
-            os.startfile(data_dir) # Preferred way on Windows
-        elif sys.platform == "darwin": # macOS
+            os.startfile(data_dir)
+        elif sys.platform == "darwin":
             subprocess.Popen(["open", data_dir])
-        else: # Linux/other Unix-like
+        else:
             subprocess.Popen(["xdg-open", data_dir])
     except FileNotFoundError:
-         if root: messagebox.showerror("Error", f"Could not find command to open folder.\nPath: {data_dir}", parent=root)
+         msg = f"Could not find command to open folder.\nPath: {data_dir}"
+         print(f"ERROR: {msg}")
+         if root and root.winfo_exists(): messagebox.showerror("Error", msg, parent=root)
     except Exception as e:
-         if root: messagebox.showerror("Error", f"Could not open folder:\n{e}\nPath: {data_dir}", parent=root)
-
+         msg = f"Could not open folder:\n{e}\nPath: {data_dir}"
+         print(f"ERROR: {msg}")
+         if root and root.winfo_exists(): messagebox.showerror("Error", msg, parent=root)
 
 # --- Helper to update Excel Status Label ---
 def update_excel_status_label(text=None):
-    # Ensure root and label exist before trying to update
+    """Updates the text of the Excel status label."""
     if not root or 'excel_status_label' not in globals() or not excel_status_label: return
-    # Check if label widget still exists
-    if not excel_status_label.winfo_exists(): return
+    try:
+        if not excel_status_label.winfo_exists(): return
+    except tk.TclError: return
 
-    if text: # Use provided text directly
+    if text:
         new_text = text
     elif excel_filepath and os.path.exists(excel_filepath):
-        # Show basename if a valid path is set
         new_text = f"Using Excel: {os.path.basename(excel_filepath)}"
     else:
-        # Default prompt
         new_text = "Drag & Drop Excel file OR place in Downloads"
     excel_status_label.config(text=new_text)
 
-# --- Drag and Drop Handlers ---
+# --- Drag and Drop Handlers (Only if tkinterdnd2 is available) ---
 def on_drag_enter(event):
+    """Handles drag enter event for visual feedback."""
     global is_dragging_over
-    print("Drag Enter detected")
     is_dragging_over = True
     try:
-        # Check if left_panel exists before configuring
         if 'left_panel' in globals() and left_panel and left_panel.winfo_exists():
             left_panel.configure(style="Hover.TFrame")
-        # Use helper to update label, avoid direct config if label might not exist yet
         update_excel_status_label(">>> Release file here <<<")
-    except Exception as e: # Catch potential TclError or NameError
-        print(f"Error applying hover style/text: {e}")
+    except tk.TclError: pass
+    except Exception as e: print(f"Error in on_drag_enter: {e}")
 
 def on_drag_leave(event):
+    """Handles drag leave event for visual feedback."""
     global is_dragging_over
-    # Only revert if we were actually dragging over
     if is_dragging_over:
-        print("Drag Leave detected")
         is_dragging_over = False
         try:
             if 'left_panel' in globals() and left_panel and left_panel.winfo_exists():
-                left_panel.configure(style="TFrame") # Revert to default style
-            # Reset label to show actual current state using helper
+                left_panel.configure(style="TFrame")
             update_excel_status_label()
-        except Exception as e:
-            print(f"Error reverting style/text: {e}")
+        except tk.TclError: pass
+        except Exception as e: print(f"Error in on_drag_leave: {e}")
 
-# Use the refined on_drop_excel_file function from previous step
 def on_drop_excel_file(event):
+    """Handles the file drop event to set the Excel file path."""
     global excel_filepath, is_dragging_over
-    print(f"Drop detected. Event Type: {type(event.data)}, Raw Data: '{event.data}'") # More detailed log
-
-    # --- Revert Visual Feedback Immediately ---
-    was_dragging = is_dragging_over # Store if we were actually hovering
+    print(f"Drop detected. Data Type: {type(event.data)}, Raw Data: '{event.data}'")
+    was_dragging = is_dragging_over
     is_dragging_over = False
     try:
         if 'left_panel' in globals() and left_panel and left_panel.winfo_exists():
              left_panel.configure(style="TFrame")
+    except tk.TclError: pass
     except Exception as e: print(f"Error reverting style on drop: {e}")
 
-    # --- Process Dropped Data ---
     excel_file_found = None
-    dropped_items = [] # Use a more generic name
+    dropped_items = []
     data_str = event.data
-
     try:
-        # Attempt to convert to string if not already (handles bytes, etc. cautiously)
         if not isinstance(data_str, str):
-            try: data_str = str(data_str, encoding='utf-8') # Try decoding if bytes
-            except TypeError: data_str = str(data_str) # Fallback to basic string conversion
+            try: data_str = str(data_str, encoding='utf-8')
+            except TypeError: data_str = str(data_str)
             print(f"Converted event.data to string: '{data_str}'")
 
         if data_str.strip():
-            # Remove potential surrounding braces first (common from Windows Explorer)
             path_string = data_str.strip().strip('{}')
             print(f"Processing path string: '{path_string}'")
-
-            # Use shlex for robust parsing (handles spaces, quotes)
-            try:
-                # Use posix=False on Windows for backslash compatibility
-                # Handle potential empty string after stripping braces
-                if path_string:
+            if path_string:
+                try:
                     dropped_items = shlex.split(path_string, posix=(sys.platform != 'win32'))
-                else:
-                    dropped_items = []
-                print(f"Parsed dropped items via shlex: {dropped_items}")
-            except ValueError as shex:
-                # Fallback: Basic split (less reliable for paths with spaces)
-                print(f"shlex parsing failed ({shex}), trying basic split.")
-                if path_string: # Avoid splitting empty string
-                    dropped_items = [p.strip() for p in path_string.split()]
-                else:
-                    dropped_items = []
-                print(f"Parsed dropped items via basic split: {dropped_items}")
+                    print(f"Parsed via shlex: {dropped_items}")
+                except ValueError as shex:
+                    print(f"shlex parsing failed ({shex}), trying basic split.")
+                    dropped_items = [p.strip() for p in path_string.split() if p.strip()]
+                    print(f"Parsed via basic split: {dropped_items}")
+            else: dropped_items = []
 
-            if not dropped_items:
-                print("Parsing resulted in no file paths.")
-
-            # --- Validate Files ---
-            # Find the first *valid* .xlsx file among potentially multiple dropped items
             for item_path in dropped_items:
-                # Clean up path just in case (remove extra quotes if shlex didn't)
                 cleaned_path = item_path.strip('\'"')
                 print(f"Checking dropped item: '{cleaned_path}'")
                 try:
-                    # Use Path object for robust checking
                     p = Path(cleaned_path)
                     if p.is_file() and p.suffix.lower() == ".xlsx" and not p.name.startswith('~'):
-                        excel_file_found = str(p) # Convert back to string for consistency
+                        excel_file_found = str(p)
                         print(f"Valid Excel file found: {excel_file_found}")
-                        break # Stop after finding the first valid one
+                        break
                     else:
-                         print(f"Item '{cleaned_path}' validation failed (Exists: {p.exists()}, IsFile: {p.is_file()}, SuffixOK: {p.suffix.lower() == '.xlsx'}, NameOK: {not p.name.startswith('~')})")
+                         print(f"Item '{cleaned_path}' rejected: IsFile={p.is_file()}, SuffixOK={p.suffix.lower() == '.xlsx'}, NotTemp={not p.name.startswith('~')}")
                 except Exception as path_err:
                      print(f"Error checking path '{cleaned_path}': {path_err}")
-        else:
-             print("Dropped data resulted in empty string.")
-
+        else: print("Dropped data was empty after stripping.")
     except Exception as parse_err:
         print(f"Error during drop processing: {parse_err}")
         import traceback
-        traceback.print_exc() # Print full traceback for parsing errors
-        if root: messagebox.showerror("Drop Error", f"Could not process dropped item:\n{parse_err}", parent=root)
-        # Ensure label is reset even after error
-        if root: root.after(0, update_excel_status_label)
-        return # Stop processing on error
+        traceback.print_exc()
+        if root and root.winfo_exists(): messagebox.showerror("Drop Error", f"Could not process dropped item:\n{parse_err}", parent=root)
+        if root and root.winfo_exists(): root.after(0, update_excel_status_label)
+        return
 
-    # --- Update based on validation result ---
     if excel_file_found:
         excel_filepath = excel_file_found
         print(f"Setting global Excel filepath: {excel_filepath}")
-        # Update the status label and show confirmation
-        if root:
-            root.after(0, update_excel_status_label) # Use helper via after()
-            messagebox.showinfo("Excel File Selected",
-                                f"Using Excel file:\n\n{os.path.basename(excel_filepath)}",
-                                parent=root)
+        if root and root.winfo_exists():
+            root.after(0, update_excel_status_label)
+            messagebox.showinfo("Excel File Selected", f"Using Excel file:\n\n{os.path.basename(excel_filepath)}", parent=root)
     else:
-        # No valid excel file found in the drop
         print(f"No valid .xlsx file found in dropped items: {dropped_items}")
-        # Show warning *only if* something was actually dragged/dropped and parsing yielded items
-        if root and (was_dragging or dropped_items): # Check if there was intent or items parsed
-            messagebox.showwarning("Invalid File Drop",
-                                   "Rejected.\nPlease drop only a single, valid Excel (.xlsx) file.",
-                                   parent=root)
-        # Reset label to show the previous or default state
-        if root: root.after(0, update_excel_status_label)
-
+        if root and root.winfo_exists() and was_dragging:
+            messagebox.showwarning("Invalid File Drop", "Rejected.\nPlease drop only a single, valid Excel (.xlsx) file.", parent=root)
+        if root and root.winfo_exists(): root.after(0, update_excel_status_label)
 
 # --- In-GUI Text Editor Functions ---
 def load_text_for_editing(period_num):
+    """Loads the content of a period's name file into the editor."""
     global editor_current_filename
-    # Ensure editor widget exists
-    if 'editor_text' not in globals() or not editor_text or not editor_text.winfo_exists(): return
+    if 'editor_text' not in globals() or not editor_text: return
+    try:
+        if not editor_text.winfo_exists() or \
+           'editor_status_label' not in globals() or \
+           not editor_status_label.winfo_exists(): return
+    except tk.TclError: return
 
-    editor_text.unbind("<KeyRelease>") # Unbind first to prevent issues
+    try: editor_text.unbind("<KeyRelease>")
+    except tk.TclError: pass
+
     filepath = get_period_filepath(period_num)
     fname = os.path.basename(filepath)
     folder_disp = os.path.join("...", DATA_SUBFOLDER_NAME)
 
     if not os.path.exists(filepath):
-        # Try creating the file if it doesn't exist
         if save_text_file(filepath, "", show_success=False):
-            if root: messagebox.showinfo("File Created", f"'{fname}' created in:\n{folder_disp}", parent=root)
+            if root and root.winfo_exists(): messagebox.showinfo("File Created", f"'{fname}' created in:\n{folder_disp}", parent=root)
             content = ""
             editor_current_filename = filepath
         else:
-            # If creation failed, disable editor and show error status
             editor_text.config(state=tk.DISABLED)
-            if 'editor_status_label' in globals() and editor_status_label.winfo_exists():
-                 editor_status_label.config(text="Editor: Error creating file")
+            editor_status_label.config(text="Editor: Error creating file")
             return
     else:
-        # File exists, read its content
         content = read_text_file(filepath)
         editor_current_filename = filepath
 
-    # Enable editor, clear old content, insert new content
     editor_text.config(state=tk.NORMAL)
     editor_text.delete("1.0", tk.END)
     editor_text.insert(tk.END, content)
-    editor_text.bind("<KeyRelease>", on_editor_key_release) # Rebind key release
-    # Update status label
-    if 'editor_status_label' in globals() and editor_status_label.winfo_exists():
-        editor_status_label.config(text=f"Editing: {fname} (in {folder_disp})")
+    editor_text.edit_reset()
+    editor_text.bind("<KeyRelease>", on_editor_key_release)
+    editor_status_label.config(text=f"Editing: {fname} (in {folder_disp})")
 
 def on_editor_key_release(event=None):
-    # Schedule the save slightly delayed to avoid saving on every single keystroke instantly
+    """Schedules the auto-save function after a brief delay."""
     global editor_save_scheduled
     if editor_save_scheduled:
-        root.after_cancel(editor_save_scheduled)
-    editor_save_scheduled = root.after(1000, save_edited_text_auto) # Save after 1 sec of inactivity
+        try: root.after_cancel(editor_save_scheduled)
+        except ValueError: pass
+    if root and root.winfo_exists():
+        editor_save_scheduled = root.after(1000, save_edited_text_auto)
 
 def save_edited_text_auto():
+    """Automatically saves the content of the editor to the current file."""
     global editor_save_scheduled
-    editor_save_scheduled = None # Clear schedule flag
+    editor_save_scheduled = None
     if not editor_current_filename: return
-    # Ensure editor exists before getting text
-    if 'editor_text' not in globals() or not editor_text or not editor_text.winfo_exists(): return
+    if 'editor_text' not in globals() or not editor_text: return
+    try:
+        if not editor_text.winfo_exists(): return
+    except tk.TclError: return
 
-    content = editor_text.get("1.0", tk.END).strip() # Get content and remove trailing/leading whitespace
-    # Add a newline only if there's content, ensures empty files stay empty
+    content = editor_text.get("1.0", tk.END).strip()
     if content: content += "\n"
-    save_text_file(editor_current_filename, content, show_success=False) # Save silently
+    save_text_file(editor_current_filename, content, show_success=False)
 
+# --- Feedback Functions (Only if requests is available) ---
+def send_feedback_request(feedback_text, feedback_window, send_button):
+    """Sends the feedback text to the Discord webhook (runs in a thread)."""
+    global root
+    if send_button and send_button.winfo_exists():
+        root.after(0, lambda: send_button.config(state=tk.DISABLED, text="Sending..."))
+
+    webhook_url = DISCORD_WEBHOOK_URL
+    headers = {'Content-Type': 'application/json'}
+    payload = {'content': f"**DeltaMath Grader Feedback:**\n```\n{feedback_text}\n```"}
+    success = False
+    error_message = ""
+
+    try:
+        print(f"Sending feedback to webhook...")
+        response = requests.post(webhook_url, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        print(f"Feedback sent successfully. Status: {response.status_code}")
+        success = True
+    except requests.exceptions.Timeout:
+        error_message = "Sending feedback timed out. Check your internet connection."
+        print(f"Error sending feedback: {error_message}")
+    except requests.exceptions.RequestException as e:
+        error_message = f"Could not send feedback:\n{e}"
+        print(f"Error sending feedback: {error_message}")
+    except Exception as e:
+        error_message = f"An unexpected error occurred:\n{e}"
+        print(f"Error sending feedback: {error_message}")
+
+    def update_gui_after_feedback():
+        parent_win = feedback_window if feedback_window and feedback_window.winfo_exists() else root
+        if not parent_win: return
+        if success:
+            messagebox.showinfo("Feedback Sent", "Thank you for your feedback!", parent=parent_win)
+            if feedback_window and feedback_window.winfo_exists():
+                feedback_window.destroy()
+        else:
+            messagebox.showerror("Feedback Error", error_message, parent=parent_win)
+            if send_button and send_button.winfo_exists():
+                send_button.config(state=tk.NORMAL, text="Send Feedback")
+
+    if root and root.winfo_exists():
+        root.after(0, update_gui_after_feedback)
+
+def open_feedback_window():
+    """Opens the feedback submission window."""
+    global root, style
+    if not requests_available or not DISCORD_WEBHOOK_URL:
+        messagebox.showerror("Feature Unavailable", "The feedback feature requires the 'requests' library and a configured webhook.\n(Check installation or console warnings)", parent=root)
+        return
+
+    feedback_window = tk.Toplevel(root)
+    feedback_window.title("Send Feedback")
+    feedback_window.configure(bg=background_color)
+    feedback_window.geometry("400x300")
+    feedback_window.resizable(False, False)
+    feedback_window.transient(root)
+    feedback_window.grab_set()
+    try:
+        root_x = root.winfo_x(); root_y = root.winfo_y()
+        root_w = root.winfo_width(); root_h = root.winfo_height()
+        win_w = 400; win_h = 300
+        x = root_x + (root_w // 2) - (win_w // 2)
+        y = root_y + (root_h // 2) - (win_h // 2)
+        feedback_window.geometry(f'{win_w}x{win_h}+{x}+{y}')
+    except tk.TclError: feedback_window.geometry("400x300")
+
+    feedback_frame = ttk.Frame(feedback_window, padding=15, style="TFrame")
+    feedback_frame.pack(fill=tk.BOTH, expand=True)
+    instruction_label = ttk.Label(feedback_frame, text="Input your feedback below, please!", style="Status.TLabel", wraplength=360)
+    instruction_label.pack(pady=(0, 10), anchor='nw')
+    text_area_frame = ttk.Frame(feedback_frame, style="TFrame")
+    text_area_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+    text_scrollbar = ttk.Scrollbar(text_area_frame, orient=tk.VERTICAL)
+    text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    feedback_text_widget = tk.Text(text_area_frame, wrap=tk.WORD, height=10, bg=editor_bg_color, fg=editor_text_color, font=editor_font, padx=5, pady=5, bd=1, relief=tk.SUNKEN, yscrollcommand=text_scrollbar.set, undo=True)
+    feedback_text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    text_scrollbar.config(command=feedback_text_widget.yview)
+    feedback_text_widget.focus_set()
+    send_button = ttk.Button(feedback_frame, text="Send Feedback", style="TButton", command=lambda: send_feedback_action(feedback_text_widget, feedback_window, send_button))
+    send_button.pack(pady=(5, 0))
+    feedback_window.wait_window()
+
+def send_feedback_action(text_widget, feedback_window, send_button):
+    """Gets text and starts the threaded feedback request."""
+    feedback_text = text_widget.get("1.0", tk.END).strip()
+    if not feedback_text:
+        messagebox.showwarning("Empty Feedback", "Please enter your feedback before sending.", parent=feedback_window)
+        return
+    feedback_thread = threading.Thread(target=send_feedback_request, args=(feedback_text, feedback_window, send_button), daemon=True)
+    feedback_thread.start()
 
 # --- UI Setup ---
-# Use tk_class which was determined during import (TkinterDnD or tk.Tk)
 root = tk_class()
-root.title("DeltaMath Grader 2.3") # Version Bump
-root.minsize(750, 700) # Set minimum window size
-
-# --- Colors, Fonts, Styles ---
+root.title("DeltaMath Grader 2.6") # Version Bump
+root.minsize(750, 700)
 background_color="#2E2E2E"; button_color="#4CAF50"; button_hover_color="#66BB6A"; text_color="#FFFFFF"; edit_button_color="#03A9F4"; edit_button_hover_color="#29B6F6"; output_bg_color="#3E3E3E"; output_text_color="#E0E0E0"; autograde_button_color="#FFC107"; autograde_button_hover_color="#FFD54F"; title_color="#FFFFFF"; editor_bg_color="#333333"; editor_text_color="#F5F5F5"; status_label_color="#BDBDBD"; link_button_color="#90CAF9"; link_button_hover_color="#BBDEFB"; folder_button_color="#FF9800"; folder_button_hover_color="#FFA726"
-hover_bg_color = "#404040" # Hover indication color
+hover_bg_color = "#404040"
 title_font=("Segoe UI", 20, "bold"); button_font=("Segoe UI", 11, "bold"); edit_button_font=("Segoe UI", 9); output_font=("Consolas", 10); editor_font=("Consolas", 10); status_font=("Segoe UI", 9)
 style=ttk.Style();
-try: style.theme_use('clam') # Clam theme often looks better if available
-except tk.TclError: style.theme_use('default') # Fallback theme
-# Configure base styles
+try: style.theme_use('clam')
+except tk.TclError: style.theme_use('default')
 style.configure("TFrame", background=background_color)
-style.configure("Hover.TFrame", background=hover_bg_color) # Style for hover state (used for DND feedback)
-style.configure("TLabel", background=background_color, foreground=title_color, font=title_font); style.configure("Status.TLabel", background=background_color, foreground=status_label_color, font=status_font); style.configure("TButton", padding=(10, 5), font=button_font, borderwidth=1); style.map("TButton", foreground=[('!active', text_color), ('active', text_color)], background=[('!active', button_color), ('active', button_hover_color)], relief=[('pressed', 'sunken'), ('!pressed', 'raised')]); style.configure("Edit.TButton", font=edit_button_font, padding=(8, 4)); style.map("Edit.TButton", foreground=[('!active', text_color), ('active', text_color)], background=[('!active', edit_button_color), ('active', edit_button_hover_color)]); style.configure("AutoGrade.TButton", padding=(15, 8)); style.map("AutoGrade.TButton", foreground=[('!active', "#212121"), ('active', "#000000")], background=[('!active', autograde_button_color), ('active', autograde_button_hover_color)]); style.configure("Link.TButton", padding=(10, 5), font=button_font, borderwidth=1); style.map("Link.TButton", foreground=[('!active', "#0D47A1"), ('active', "#0D47A1")], background=[('!active', link_button_color), ('active', link_button_hover_color)], relief=[('pressed', 'sunken'), ('!pressed', 'raised')]); style.configure("Folder.TButton", padding=(10, 5), font=button_font); style.map("Folder.TButton", foreground=[('!active', text_color), ('active', text_color)], background=[('!active', folder_button_color), ('active', folder_button_hover_color)], relief=[('pressed', 'sunken'), ('!pressed', 'raised')])
-# Apply background color to the root window itself
+style.configure("Hover.TFrame", background=hover_bg_color)
+style.configure("TLabel", background=background_color, foreground=title_color, font=title_font)
+style.configure("Status.TLabel", background=background_color, foreground=status_label_color, font=status_font)
+style.configure("TButton", padding=(10, 5), font=button_font, borderwidth=1)
+style.map("TButton", foreground=[('!active', text_color), ('active', text_color)], background=[('!active', button_color), ('active', button_hover_color)], relief=[('pressed', 'sunken'), ('!pressed', 'raised')])
+style.configure("Edit.TButton", font=edit_button_font, padding=(8, 4))
+style.map("Edit.TButton", foreground=[('!active', text_color), ('active', text_color)], background=[('!active', edit_button_color), ('active', edit_button_hover_color)])
+style.configure("AutoGrade.TButton", padding=(15, 8))
+style.map("AutoGrade.TButton", foreground=[('!active', "#212121"), ('active', "#000000")], background=[('!active', autograde_button_color), ('active', autograde_button_hover_color)])
+style.configure("Link.TButton", padding=(10, 5), font=button_font, borderwidth=1)
+style.map("Link.TButton", foreground=[('!active', "#0D47A1"), ('active', "#0D47A1")], background=[('!active', link_button_color), ('active', link_button_hover_color)], relief=[('pressed', 'sunken'), ('!pressed', 'raised')])
+style.configure("Folder.TButton", padding=(10, 5), font=button_font)
+style.map("Folder.TButton", foreground=[('!active', text_color), ('active', text_color)], background=[('!active', folder_button_color), ('active', folder_button_hover_color)], relief=[('pressed', 'sunken'), ('!pressed', 'raised')])
 root.configure(bg=background_color)
 
 # --- Drag and Drop Setup ---
-# Check if DND_FILES is available (meaning tkinterdnd2 likely loaded)
-# and if the root window object supports drop target registration
-if DND_FILES and hasattr(root, 'drop_target_register'):
+if tkinterdnd2_available and DND_FILES and hasattr(root, 'drop_target_register'):
     try:
-        root.drop_target_register(DND_FILES) # Register for file drops
-        # Bind specific drag events to the handlers defined earlier
+        root.drop_target_register(DND_FILES)
         root.dnd_bind('<<DragEnter>>', on_drag_enter)
         root.dnd_bind('<<DragLeave>>', on_drag_leave)
         root.dnd_bind('<<Drop>>', on_drop_excel_file)
-        print("Drag/drop events bound to root window.")
+        print("Drag/drop events bound successfully.")
     except tk.TclError as dnd_err:
         print(f"Warning: DND register/bind failed: {dnd_err}")
-        if root: messagebox.showwarning("DND Error", f"Could not initialize drag & drop:\n{dnd_err}", parent=root)
+        if root and root.winfo_exists(): messagebox.showwarning("DND Error", f"Could not initialize drag & drop:\n{dnd_err}", parent=root)
 else:
-    print("Drag/drop disabled (tkinterdnd2 likely not available or failed).")
-
+    print("Drag/drop bindings skipped (tkinterdnd2 not available or failed).")
 
 # --- Main Layout Frames ---
-# Paned window allows resizing between left/right panels
 paned_window = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
 paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-style.configure("TPanedwindow", background=background_color) # Style the sash
-
-# Left panel (controls)
-# Apply default style initially, hover style applied by DND handlers
+style.configure("TPanedwindow", background=background_color)
 left_panel = ttk.Frame(paned_window, padding=15, style="TFrame")
-paned_window.add(left_panel, weight=1) # Weight determines relative size
-
-# Right panel (output/editor)
+paned_window.add(left_panel, weight=1)
 right_panel = ttk.Frame(paned_window, padding=15, style="TFrame")
-paned_window.add(right_panel, weight=3) # Give right panel more initial space
+paned_window.add(right_panel, weight=3)
 
 # --- Left Panel Widgets ---
 title_label = ttk.Label(left_panel, text="DeltaMath Grader", style="TLabel")
-title_label.pack(pady=(0, 15)) # Padding below title
-
-# Status label for Excel file status
+title_label.pack(pady=(0, 15))
 excel_status_label = ttk.Label(left_panel, text="Initializing...", style="Status.TLabel")
-excel_status_label.pack(pady=(0, 15), fill=tk.X) # Fill horizontally
-# Schedule initial update slightly after window appears
+excel_status_label.pack(pady=(0, 15), fill=tk.X)
 root.after(50, update_excel_status_label)
-
-# Frame to hold period buttons
 periods_frame = ttk.Frame(left_panel, style="TFrame")
 periods_frame.pack(fill=tk.X, pady=5)
 
 # --- Right Panel Widgets ---
-# Vertical paned window for splitting Output and Editor areas
 right_v_pane = ttk.PanedWindow(right_panel, orient=tk.VERTICAL)
 right_v_pane.pack(fill=tk.BOTH, expand=True)
-style.configure("Vertical.TPanedwindow", background=background_color) # Style sash
-
-# Output Area Frame
+style.configure("Vertical.TPanedwindow", background=background_color)
 output_frame = ttk.Frame(right_v_pane, style="TFrame", padding=(0, 0, 0, 5))
-right_v_pane.add(output_frame, weight=2) # Output gets more initial space
-
+right_v_pane.add(output_frame, weight=2)
 output_label = ttk.Label(output_frame, text="Processing Results:", font=("Segoe UI", 11, "bold"), background=background_color, foreground=output_text_color)
-output_label.pack(anchor='nw', pady=(0, 3)) # Align label top-left
-
+output_label.pack(anchor='nw', pady=(0, 3))
 output_text_frame = ttk.Frame(output_frame, style="TFrame")
 output_text_frame.pack(fill=tk.BOTH, expand=True)
 output_scrollbar = ttk.Scrollbar(output_text_frame, orient=tk.VERTICAL)
 output_scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
-output_text = tk.Text(output_text_frame, wrap=tk.WORD, bg=output_bg_color, fg=output_text_color, font=output_font, padx=8, pady=5, relief=tk.SUNKEN, bd=1, undo=True, yscrollcommand=output_scrollbar.set)
+output_text = tk.Text(output_text_frame, wrap=tk.WORD, bg=output_bg_color, fg=output_text_color, font=output_font, padx=8, pady=5, relief=tk.SUNKEN, bd=1, undo=True, yscrollcommand=output_scrollbar.set, state=tk.DISABLED)
 output_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
 output_scrollbar.config(command=output_text.yview)
-
-# Editor Area Frame
 editor_frame = ttk.Frame(right_v_pane, style="TFrame", padding=(0, 5, 0, 0))
-right_v_pane.add(editor_frame, weight=1) # Editor gets less initial space
-
+right_v_pane.add(editor_frame, weight=1)
 editor_status_label = ttk.Label(editor_frame, text="Editor: No File Loaded", font=("Segoe UI", 11, "bold"), background=background_color, foreground=editor_text_color)
-editor_status_label.pack(anchor='nw', pady=(0, 3)) # Align label top-left
-
+editor_status_label.pack(anchor='nw', pady=(0, 3))
 editor_text_frame = ttk.Frame(editor_frame, style="TFrame")
 editor_text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
 editor_scrollbar = ttk.Scrollbar(editor_text_frame, orient=tk.VERTICAL)
 editor_scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
-editor_text = tk.Text(editor_text_frame, wrap=tk.WORD, bg=editor_bg_color, fg=editor_text_color, font=editor_font, padx=8, pady=5, relief=tk.SUNKEN, bd=1, undo=True, yscrollcommand=editor_scrollbar.set)
+editor_text = tk.Text(editor_text_frame, wrap=tk.WORD, bg=editor_bg_color, fg=editor_text_color, font=editor_font, padx=8, pady=5, relief=tk.SUNKEN, bd=1, undo=True, yscrollcommand=editor_scrollbar.set, state=tk.DISABLED)
 editor_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
 editor_scrollbar.config(command=editor_text.yview)
-# Start editor disabled until a file is loaded
-editor_text.config(state=tk.DISABLED)
 
 # --- Period Buttons ---
 def create_period_buttons(parent_frame, period_num, output_widget):
+    """Creates the Grade and Edit buttons for a specific period."""
     frame = ttk.Frame(parent_frame, style="TFrame")
     frame.pack(fill=tk.X, pady=3)
-    # Grade button calls process_grade_level with period number
     grade_button = ttk.Button(frame, text=f"Grade P{period_num}",
                              command=lambda p=period_num: process_grade_level(p, output_widget),
                              style="TButton")
     grade_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
-    # Edit button calls load_text_for_editing with period number
     edit_button = ttk.Button(frame, text=f"Edit P{period_num}",
                             command=lambda p=period_num: load_text_for_editing(p),
                             style="Edit.TButton")
     edit_button.pack(side=tk.LEFT, padx=(5, 0))
 
-# Create buttons for periods 1 through 8
 for i in range(1, 9):
     create_period_buttons(periods_frame, i, output_text)
 
 # --- Spacers and Bottom Buttons ---
 ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=15)
-
 data_folder_button = ttk.Button(left_panel, text="Open Period Files Folder", command=open_data_folder, style="Folder.TButton")
 data_folder_button.pack(pady=(5, 5), fill=tk.X)
-
 gradebook_link_button = ttk.Button(left_panel, text="Class Grade Sheet Page", command=open_gradebook_link, style="Link.TButton")
 gradebook_link_button.pack(pady=5, fill=tk.X)
-
 auto_grade_button = ttk.Button(left_panel, text = "Auto Grade (Press * After Clicking)", command = auto_grade_action, style = "AutoGrade.TButton")
 auto_grade_button.pack(pady=5, fill=tk.X)
-
 ttk.Separator(left_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=15)
-
-# Frame for Help/Credits buttons at the bottom
-help_credits_frame = ttk.Frame(left_panel, style="TFrame")
-help_credits_frame.pack(pady=10, fill=tk.X)
-
-credits_button = ttk.Button(help_credits_frame, text="Credits", command=show_credits, style="Edit.TButton")
-credits_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
-
-# --- Final Setup ---
-# Disable output text initially, enable only when adding text
-output_text.config(state=tk.DISABLED)
+utility_buttons_frame = ttk.Frame(left_panel, style="TFrame")
+utility_buttons_frame.pack(pady=10, fill=tk.X)
+feedback_button = ttk.Button(utility_buttons_frame, text="Feedback", command=open_feedback_window, style="Edit.TButton")
+feedback_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+credits_button = ttk.Button(utility_buttons_frame, text="Credits", command=show_credits, style="Edit.TButton")
+credits_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5, 0))
 
 # --- Application Exit Handling ---
 def on_closing():
+    """Handles application close event."""
     print("Closing application...")
-    # Optional: Perform any cleanup here if needed (e.g., saving unsaved changes)
-    # get_data_folder() # Calling this here doesn't do much unless needed for cleanup path
-    if root: root.destroy() # Destroy the main window
-
-# Assign the closing handler to the window's close button (X)
+    if root: root.destroy()
 root.protocol("WM_DELETE_WINDOW", on_closing)
 
 # --- Excel File Processing Logic ---
 def process_grade_level(period_num, output_widget):
-    global excel_filepath # Use the global path set by DND or find_excel_file_automatically
-    current_excel_path = excel_filepath # Work with a local copy for this run
+    """Main logic for processing grades, focusing on 'Grade' or 'Complete' columns."""
+    global excel_filepath
 
-    # 1. Check if a valid Excel path is already set
+    # 1. Determine Excel File Path
+    current_excel_path = excel_filepath
     if not current_excel_path or not os.path.exists(current_excel_path):
         print("No valid Excel file set or path invalid, searching Downloads...")
         current_excel_path = find_excel_file_automatically()
         if current_excel_path:
-            excel_filepath = current_excel_path # Update global path if found
-            if root: root.after(0, update_excel_status_label) # Update label via helper
+            excel_filepath = current_excel_path
+            if root and root.winfo_exists(): root.after(0, update_excel_status_label)
         else:
-            if root: messagebox.showerror("Error", "No Excel file selected.\nDrag & drop an .xlsx file or place one in Downloads.", parent=root)
-            return # Stop if no file found
+            if root and root.winfo_exists(): messagebox.showerror("Error", "No Excel file selected or found.\nDrag & drop an .xlsx file or place one in Downloads.", parent=root)
+            return
 
-    # 2. Double-check the path after potential auto-find
     if not current_excel_path or not os.path.exists(current_excel_path):
-         if root: messagebox.showerror("Error", f"Excel file still not found or invalid:\n{current_excel_path}", parent=root)
-         # Reset global path if the current attempt failed with it
-         if excel_filepath == current_excel_path: excel_filepath = None
-         if root: root.after(0, update_excel_status_label)
+         if root and root.winfo_exists(): messagebox.showerror("Error", f"Excel file not found or invalid:\n{current_excel_path}", parent=root)
+         excel_filepath = None
+         if root and root.winfo_exists(): root.after(0, update_excel_status_label)
          return
 
-    # 3. Import pandas (only when needed) and load Excel
-    try: import pandas as pd
-    except ImportError:
-        if root: messagebox.showerror("Import Error", "Library 'pandas' not found.\nPlease ensure it's installed:\npip install pandas", parent=root)
-        return
-
+    # 2. Setup File Paths and Display Names
     excel_file_basename = os.path.basename(current_excel_path)
     namelist_filepath = get_period_filepath(period_num)
     namelist_fname = os.path.basename(namelist_filepath)
-    folder_disp = os.path.join("...", DATA_SUBFOLDER_NAME) # For display messages
+    folder_disp = os.path.join("...", DATA_SUBFOLDER_NAME)
 
-    # 4. Check/Create Name List File
+    # 3. Check/Create Name List File
     if not os.path.exists(namelist_filepath):
         if save_text_file(namelist_filepath, "", show_success=False):
-            msg = f"'{namelist_fname}' created in:\n{folder_disp}\n\nEdit this file (use 'Edit P{period_num}') to add names before grading."
-            if root: messagebox.showinfo("File Created", msg, parent=root)
-            # Update output widget to inform user
-            output_widget.config(state=tk.NORMAL)
-            output_widget.delete("1.0", tk.END)
-            output_widget.insert(tk.END, f"-- P{period_num} Results --\n\nName list '{namelist_fname}' created.\nAdd names via 'Edit P{period_num}' and Grade again.")
-            output_widget.config(state=tk.DISABLED)
-            return # Stop processing, user needs to add names
+            msg = f"'{namelist_fname}' created in:\n{folder_disp}\n\nEdit this file (use 'Edit P{period_num}') to add student names before grading."
+            if root and root.winfo_exists(): messagebox.showinfo("File Created", msg, parent=root)
+            try:
+                output_widget.config(state=tk.NORMAL)
+                output_widget.delete("1.0", tk.END)
+                output_widget.insert(tk.END, f"-- P{period_num} Results --\n\nName list '{namelist_fname}' created.\nAdd names via 'Edit P{period_num}' and Grade again.")
+                output_widget.config(state=tk.DISABLED)
+            except tk.TclError: pass
+            return
         else:
-            if root: messagebox.showerror("Error", f"Could not create '{namelist_fname}'. Check permissions.", parent=root)
+            if root and root.winfo_exists(): messagebox.showerror("Error", f"Could not create '{namelist_fname}'. Check folder permissions.", parent=root)
             return
 
-    # 5. Load Excel Data and check required columns
+    # 4. Load Excel Data and Find Name Columns
+    parent_win = root if root and root.winfo_exists() else None # Parent for dialogs
     try:
-        df = pd.read_excel(current_excel_path)
-        # Create a mapping of lower-case column names to original case for flexibility
-        cols = {str(c).strip().lower(): str(c).strip() for c in df.columns}
-        first_col = cols.get("first name") # Check common variations
-        if not first_col: first_col = cols.get("first")
-        last_col = cols.get("last name")
-        if not last_col: last_col = cols.get("last")
-        grade_col = cols.get("grade") # Assuming 'Grade' is the target column
+        df = pd.read_excel(current_excel_path, engine='openpyxl')
+        cols_map = {str(c).strip().lower(): str(c).strip() for c in df.columns}
+        first_col = cols_map.get("first name") or cols_map.get("first")
+        last_col = cols_map.get("last name") or cols_map.get("last")
 
-        # Check if essential columns were found
-        if not all([first_col, last_col, grade_col]):
-            missing = []
-            if not first_col: missing.append("'First Name'/'First'")
-            if not last_col: missing.append("'Last Name'/'Last'")
-            if not grade_col: missing.append("'Grade'")
-            msg = f"Missing required columns in '{excel_file_basename}':\n{', '.join(missing)}."
-            if root: messagebox.showerror("Excel Column Error", msg, parent=root)
+        missing_name_cols = []
+        if not first_col: missing_name_cols.append("'First Name'/'First'")
+        if not last_col: missing_name_cols.append("'Last Name'/'Last'")
+        if missing_name_cols:
+            msg = f"Missing required name columns in '{excel_file_basename}':\n{', '.join(missing_name_cols)}."
+            if parent_win: messagebox.showerror("Excel Column Error", msg, parent=parent_win)
             return
-    except FileNotFoundError:
-         if root: messagebox.showerror("Excel Error", f"Excel file not found during read:\n{current_excel_path}", parent=root)
-         return
+
     except Exception as e:
-         if root: messagebox.showerror("Excel Read Error", f"Error loading data from '{excel_file_basename}':\n{e}", parent=root)
+         if parent_win: messagebox.showerror("Excel Read Error", f"Error loading data from '{excel_file_basename}':\n{e}", parent=parent_win)
          return
 
-    # 6. Load Names from the period file
+    # --- MODIFIED: Select Grade Column (Focus on 'Grade' and 'Complete') ---
+    all_column_names = [str(c).strip() for c in df.columns]
+    # Define the specific target column names (case-insensitive)
+    target_columns_lower = {'grade', 'complete'}
+
+    # Filter columns: Keep only those matching 'grade' or 'complete'
+    selectable_columns = [
+        col for col in all_column_names
+        if col.lower() in target_columns_lower
+    ]
+    print(f"Found potential grade columns ('Grade'/'Complete'): {selectable_columns}")
+
+    selected_grade_col = None
+    if not selectable_columns:
+        # Update error message if neither is found
+        msg = f"Could not find required columns named 'Grade' or 'Complete' in '{excel_file_basename}'."
+        if parent_win: messagebox.showerror("Excel Column Error", msg, parent=parent_win)
+        return
+    elif len(selectable_columns) == 1:
+        # Automatically select if only one ('Grade' or 'Complete') is found
+        selected_grade_col = selectable_columns[0]
+        print(f"Automatically selected available column: '{selected_grade_col}'")
+    else:
+        # Prompt user only if BOTH 'Grade' and 'Complete' are found
+        prompt = f"Both 'Grade' and 'Complete' columns found in '{excel_file_basename}'.\nSelect the one to use for grading:\n\n"
+        prompt += "\n".join([f"{i+1}. {col}" for i, col in enumerate(selectable_columns)])
+        choice = tkinter.simpledialog.askstring("Select Grade Column", prompt, parent=parent_win)
+
+        if choice is None:
+            print("Grade column selection cancelled by user.")
+            return # User cancelled
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(selectable_columns):
+                selected_grade_col = selectable_columns[idx]
+                print(f"User selected grade column: '{selected_grade_col}'")
+            else:
+                raise ValueError("Choice out of range")
+        except (ValueError, TypeError):
+            msg = "Invalid selection. Please enter the number corresponding to the column."
+            if parent_win: messagebox.showerror("Invalid Input", msg, parent=parent_win)
+            return # Stop processing on invalid input
+
+    # --- End MODIFIED: Select Grade Column ---
+
+    # 5. Load Names from the Period File
     names_to_process = load_names_from_file(namelist_filepath)
     if not names_to_process:
-        if root: messagebox.showinfo("Info", f"Name list '{namelist_fname}' is empty.\nAdd names using 'Edit P{period_num}' and try grading again.", parent=root)
-        # Update output widget
-        output_widget.config(state=tk.NORMAL); output_widget.delete("1.0", tk.END)
-        output_widget.insert(tk.END, f"-- P{period_num} Results --\n(No names found in {namelist_fname})")
-        output_widget.config(state=tk.DISABLED); return
+        if parent_win: messagebox.showinfo("Info", f"Name list '{namelist_fname}' is empty.\nAdd names using 'Edit P{period_num}' and try grading again.", parent=parent_win)
+        try:
+            output_widget.config(state=tk.NORMAL); output_widget.delete("1.0", tk.END)
+            output_widget.insert(tk.END, f"-- P{period_num} Results --\n(No names found in {namelist_fname})")
+            output_widget.config(state=tk.DISABLED)
+        except tk.TclError: pass
+        return
 
-    # 7. Get Grading Options (Interval Grading)
-    use_interval = messagebox.askyesno("Grading Option", "Apply interval grading?\n(e.g., >= 50% becomes 100%, < 50% becomes 0%)", parent=root)
-    interval_percentage = 50.0 # Default threshold
+    # 6. Get Grading Options (Interval Grading)
+    use_interval = messagebox.askyesno("Grading Option", "Apply interval grading?\n(e.g., >= 50% becomes 100%, < 50% becomes 0%)", parent=parent_win)
+    interval_percentage = 50.0
     if use_interval:
         valid_input = False
         while not valid_input:
-            val_str = tkinter.simpledialog.askstring("Interval Threshold %", "Enter minimum percentage required to get 100% (e.g., 50):", initialvalue=str(int(interval_percentage)), parent=root)
-            if val_str is None: return # User cancelled the dialog
+            val_str = tkinter.simpledialog.askstring("Interval Threshold %", "Enter minimum percentage required to get 100%\n(e.g., 50):", initialvalue=str(int(interval_percentage)), parent=parent_win)
+            if val_str is None: return # User cancelled
             try:
                 pct = float(val_str)
                 if 0 <= pct <= 100:
-                    interval_percentage = pct
-                    valid_input = True
+                    interval_percentage = pct; valid_input = True
                 else:
-                    if root: messagebox.showerror("Error", "Percentage must be between 0 and 100.", parent=root)
+                    if parent_win: messagebox.showerror("Error", "Percentage must be between 0 and 100.", parent=parent_win)
             except ValueError:
-                if root: messagebox.showerror("Error", "Invalid number entered.", parent=root)
-            except Exception as e: # Catch other potential errors
-                 if root: messagebox.showerror("Input Error", f"An unexpected error occurred: {e}", parent=root)
-                 return # Exit if unexpected error during input
+                if parent_win: messagebox.showerror("Error", "Invalid number entered.", parent=parent_win)
+            except Exception as e:
+                 if parent_win: messagebox.showerror("Input Error", f"An unexpected error occurred: {e}", parent=parent_win)
+                 return
 
-    # 8. Process Names and Generate Output
+    # 7. Process Names and Generate Output (Pass the SELECTED grade column)
     output_lines = []
-    df_modified = df.copy() # Work on a copy of the DataFrame for potential modifications
-    print(f"\n--- Processing P{period_num} using '{excel_file_basename}' ---")
+    df_modified = df.copy()
+    print(f"\n--- Processing P{period_num} using Grade Column '{selected_grade_col}' ---")
     t_start = time.time()
     for name in names_to_process:
-        # Pass df_modified so interval changes can be applied *before* saving
-        result_line = process_name(name, df_modified, first_col, last_col, grade_col, use_interval, interval_percentage)
+        # *** Pass selected_grade_col instead of a hardcoded name ***
+        result_line = process_name(name, df_modified, first_col, last_col, selected_grade_col, use_interval, interval_percentage)
         output_lines.append(result_line)
     print(f"--- Finished P{period_num} processing in {time.time() - t_start:.2f}s ---")
 
-    # 9. Save Output File and potentially the Modified Excel File
+    # 8. Save Output File and potentially the Modified Excel File
     output_file = "output_grades.txt"
     output_filepath = os.path.join(get_data_folder(), output_file)
-    output_fname = os.path.basename(output_filepath)
+    output_fname_display = os.path.basename(output_filepath)
     try:
-        # Save the text output results
         with open(output_filepath, 'w', encoding='utf-8') as f_out:
             f_out.write("\n".join(output_lines) + "\n")
         print(f"Processing results written to: {output_filepath}")
 
-        save_msg_parts = [f"Results saved to '{output_fname}' (in {folder_disp})."]
+        save_msg_parts = [f"Results saved to '{output_fname_display}' (in {folder_disp})."]
 
-        # Save the Excel file back *only* if interval grading was used and modified the DataFrame
-        # Check if the modified DataFrame is different from the original
         if use_interval and not df_modified.equals(df):
             try:
-                df_modified.to_excel(current_excel_path, index=False)
+                df_modified.to_excel(current_excel_path, index=False, engine='openpyxl')
                 print(f"Excel file '{excel_file_basename}' updated with interval grades.")
-                save_msg_parts.append(f"Excel '{excel_file_basename}' UPDATED with interval grades.")
+                save_msg_parts.append(f"Excel '{excel_file_basename}' UPDATED with interval grades (column: '{selected_grade_col}').") # Mention column
             except PermissionError:
-                 # Specific error if Excel file is open
                  msg = f"PERMISSION DENIED saving updated Excel file.\nPlease close '{excel_file_basename}' if it's open and try again."
-                 if root: messagebox.showerror("Excel Save Error", msg, parent=root)
-                 # Still show results were saved to text file
+                 print(f"ERROR: {msg}")
+                 if parent_win: messagebox.showerror("Excel Save Error", msg, parent=parent_win)
                  save_msg_parts.append(f"Excel '{excel_file_basename}' NOT updated (Permission Error).")
             except Exception as excel_save_err:
                  msg = f"Error saving updated Excel file '{excel_file_basename}':\n{excel_save_err}"
-                 if root: messagebox.showerror("Excel Save Error", msg, parent=root)
+                 print(f"ERROR: {msg}")
+                 if parent_win: messagebox.showerror("Excel Save Error", msg, parent=parent_win)
                  save_msg_parts.append(f"Excel '{excel_file_basename}' NOT updated (Save Error).")
-        else:
-            save_msg_parts.append(f"Excel '{excel_file_basename}' NOT modified.")
 
-        # Show success message combining results
-        if root: messagebox.showinfo("Success", f"Processed P{period_num}.\n\n" + "\n".join(save_msg_parts), parent=root)
+        if parent_win: messagebox.showinfo("Success", f"Processed P{period_num}.\n\n" + "\n".join(save_msg_parts), parent=parent_win)
 
-        # 10. Update UI Output Text Area
-        output_widget.config(state=tk.NORMAL)
-        output_widget.delete("1.0", tk.END)
-        # Create a header for the output
-        interval_info = f"On, Threshold={interval_percentage}%" if use_interval else "Off"
-        header = f"-- Results P{period_num} --\n"
-        header += f"(Using Excel: '{excel_file_basename}')\n"
-        header += f"(Using Names: '{namelist_fname}')\n"
-        header += f"(Interval Grading: {interval_info})\n\n"
-        output_widget.insert(tk.END, header + "\n".join(output_lines) + "\n")
-        output_widget.config(state=tk.DISABLED) # Disable editing
+        # 9. Update UI Output Text Area (Add selected grade column info)
+        try:
+            output_widget.config(state=tk.NORMAL)
+            output_widget.delete("1.0", tk.END)
+            interval_info = f"On, Threshold={interval_percentage}%" if use_interval else "Off"
+            header = f"-- Results P{period_num} --\n"
+            header += f"(Using Excel: '{excel_file_basename}')\n"
+            header += f"(Using Names: '{namelist_fname}')\n"
+            header += f"(Using Grade Column: '{selected_grade_col}')\n" # Added line
+            header += f"(Interval Grading: {interval_info})\n{'-'*30}\n"
+            output_widget.insert(tk.END, header + "\n".join(output_lines) + "\n")
+            output_widget.config(state=tk.DISABLED)
+        except tk.TclError: pass
 
     except PermissionError as perm_err:
-        # General permission error (might be output file or Excel read/write)
         msg = f"PERMISSION DENIED.\nCheck permissions for folder:\n{get_data_folder()}\nAnd file:\n{current_excel_path}\n\nError details: {perm_err}"
-        if root: messagebox.showerror("File Permission Error", msg, parent=root)
+        print(f"ERROR: {msg}")
+        if parent_win: messagebox.showerror("File Permission Error", msg, parent=parent_win)
     except Exception as e:
-        # Catch any other errors during saving/UI update
-        if root: messagebox.showerror("Saving/Display Error", f"An error occurred saving results or updating display:\n{e}", parent=root)
+        msg = f"An error occurred saving results or updating display:\n{e}"
+        print(f"ERROR: {msg}")
+        if parent_win: messagebox.showerror("Saving/Display Error", msg, parent=parent_win)
 
 
 # --- Run the Application ---
 if __name__ == "__main__":
-    print(f"Starting Yanez DELTA GOD 2.3...")
-    print(f"Ensuring data folder exists: {get_data_folder()}") # Create data folder on startup
+    print(f"Starting DeltaMath Grader 2.6...")
 
-    # Check if optional dependencies for Auto Grade are installed
-    auto_grade_enabled = True
-    try: import pyautogui
-    except ImportError:
-        print("WARN: Optional library 'pyautogui' missing, Auto Grade feature disabled.")
-        auto_grade_enabled = False
-    try: import keyboard
-    except ImportError:
-        print("WARN: Optional library 'keyboard' missing, Auto Grade trigger ('*') might not work.")
-        # Auto-grade might still partially work if pyautogui is present, but trigger is manual
+    # Function to disable/update buttons based on available optional libraries
+    def check_and_update_button_states():
+        if not root or not root.winfo_exists(): return
+        try: # Auto Grade Button
+             if 'auto_grade_button' in globals() and auto_grade_button and auto_grade_button.winfo_exists():
+                 if not pyautogui_available: auto_grade_button.config(state=tk.DISABLED, text="Auto Grade (Needs pyautogui)")
+                 elif not keyboard_available: auto_grade_button.config(text="Auto Grade (Click OK to trigger)")
+                 else: auto_grade_button.config(state=tk.NORMAL, text="Auto Grade (Press * After Clicking)")
+        except tk.TclError: pass
+        try: # Feedback Button
+             if 'feedback_button' in globals() and feedback_button and feedback_button.winfo_exists():
+                 if not requests_available: feedback_button.config(state=tk.DISABLED, text="Feedback (Needs requests)")
+                 else: feedback_button.config(state=tk.NORMAL, text="Feedback")
+        except tk.TclError: pass
 
-    # Function to disable the button if dependencies are missing
-    def check_and_disable_button():
-        # Check if button exists before configuring
-        if not auto_grade_enabled and 'auto_grade_button' in globals() and auto_grade_button and auto_grade_button.winfo_exists():
-            auto_grade_button.config(state=tk.DISABLED, text="Auto Grade (Disabled - Missing Libs)")
-            print("Auto Grade button disabled due to missing dependencies.")
-
-    # Schedule the check after the main window elements are created
-    root.after(100, check_and_disable_button)
+    root.after(100, check_and_update_button_states) # Schedule check after GUI loads
 
     try:
         print("Starting Tkinter main loop...")
-        root.mainloop() # Start the GUI event loop
+        root.mainloop()
     except KeyboardInterrupt:
         print("\nCtrl+C detected. Exiting.")
-        on_closing() # Call cleanup function on interrupt
+        on_closing()
     except Exception as main_err:
-        # Catch unexpected errors during mainloop execution
         print(f"\n--- UNEXPECTED APPLICATION ERROR ---")
         print(f"{type(main_err).__name__}: {main_err}")
         import traceback
-        traceback.print_exc() # Print full traceback
-        # Attempt graceful exit if possible
+        traceback.print_exc()
         try: on_closing()
-        except: pass # Ignore errors during cleanup after main error
+        except: pass
